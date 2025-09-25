@@ -1,0 +1,8 @@
+[package]
+name = "puhl-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rsoderh_chess = { git = "https://github.com/INDA25PlusPlus/rsoderh-chess.git", branch = "main" }
+ggez = { version = "0.10.0-rc0", default-features = false, features = ["c_dependencies", "gamepad"] }
