@@ -1,6 +1,6 @@
 # Rust Chess GUI
 
-A simple chess game written in Rust, using [`ggez`](https://ggez.rs/) for graphics and [`rsoderh_chess`](https://github.com/rsoderh_chess) for the chess logic.
+A simple chess game written in Rust, using [`ggez`](https://ggez.rs/) for graphics and [`rsoderh_chess`](https://github.com/INDA25PlusPlus/rsoderh-chess) for the chess logic.
 
 ## How to run
 Clone this repo and build with Cargo:
