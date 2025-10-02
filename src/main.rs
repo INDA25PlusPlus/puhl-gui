@@ -1,5 +1,9 @@
-use std::mem;
+use std::net::{TcpListener, TcpStream};
+use std::{env, mem};
 use std::collections::HashMap;
+
+pub mod protocol;
+pub mod network;
 
 use ggez::{
     Context, ContextBuilder, GameResult,
@@ -9,6 +13,9 @@ use ggez::{
 };
 
 use rsoderh_chess::*;
+
+use crate::network::{read_message, send_message, NetError};
+use crate::protocol::{Message, MessageMove};
 
 const SCREEN_WIDTH: f32 = 800.0;
 const SCREEN_HEIGHT: f32 = 800.0;
@@ -280,16 +287,71 @@ impl GUIBoard {
 // Main game container
 struct MyGame {
     board: GUIBoard,
+    stream: Option<TcpStream>,
+    playing_as: Color,
 }
 
 impl MyGame {
-    pub fn new(ctx: &mut Context) -> Self {
-        Self { board: GUIBoard::new(ctx) }
+    pub fn new(ctx: &mut Context, stream: Option<TcpStream>, playing_as: Color) -> Self {
+        Self { board: GUIBoard::new(ctx), stream, playing_as }
     }
 }
 
 impl EventHandler for MyGame {
     fn update(&mut self, _ctx: &mut Context) -> GameResult {
+        if self.board.game.turn == self.playing_as {
+            return Ok(());
+        }
+        match self.stream.as_mut() {
+            Some(stream) => {
+                let message = read_message(stream);
+                match message {
+                    Ok(message) => {
+                        match message {
+                            Message::Move(message) => {
+                                let placeholder = Game::new(self.board.game.board().clone(), self.board.game.turn);
+                                let game = mem::replace(&mut self.board.game, placeholder);
+                                let result = match message.prom_piece {
+                                    Some(piece_kind) => game.perform_move(HalfMoveRequest::Promotion { column: message.mv.1.column, kind: piece_kind }),
+                                    None => game.perform_move(HalfMoveRequest::Standard { source: message.mv.0, dest: message.mv.1 }),
+                                };
+
+                                self.board.game = match result {
+                                    MoveResult::Ongoing(new_game, check) => {
+                                        println!("Check outcome: {:?}", check);
+                                        new_game
+                                    }
+                                    MoveResult::Finished(finished) => {
+                                        println!("Game over: {:?}", finished.result());
+
+                                        let rsoderh_chess::GameResult::Checkmate { winner, .. } = finished.result();
+                                        self.board.winner = Some(*winner);
+
+                                        Game::new(finished.board().clone(), self.board.game.turn)
+                                    }
+                                    MoveResult::Illegal(_game, why) => {
+                                        println!("Illegal move: {:?}", why);
+                                        let _ = send_message(stream, &Message::Quit("Desync".to_string()));
+                                        panic!("Board desync!!!");
+                                    }
+                                };
+                            },
+                            Message::Quit(s) => {
+                                panic!("Opponent quit: {s}");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        match e {
+                            NetError::IoError(_e) => {},
+                            NetError::ParseError(e) => panic!("Failed to read opponent moves: {e:?}"),
+                            NetError::SerializeError(e) => panic!("Failed to read opponent moves: {e:?}"),
+                        }
+                    }
+                }
+            },
+            None => (),
+        };
         Ok(())
     }
 
@@ -309,7 +371,10 @@ impl EventHandler for MyGame {
         if button != MouseButton::Left {
             return Ok(());
         }
-
+        // Don't play if it's not your turn
+        if self.board.game.turn != self.playing_as {
+            return Ok(());
+        }
         // Reset if game ended
         if self.board.winner.is_some() {
             self.board.reset();
@@ -331,7 +396,8 @@ impl EventHandler for MyGame {
                     self.board.perform_move(HalfMoveRequest::Promotion { column, kind: *kind });
                     self.board.ui_state = UIState::Normal;
                     self.board.selected_position = None;
-                    return Ok(());
+
+                    unimplemented!("Promotion not implemented");
                 }
             }
             return Ok(());
@@ -367,6 +433,18 @@ impl EventHandler for MyGame {
                             source: src_position,
                             dest: clicked_position,
                         });
+                        let message = Message::Move(MessageMove {
+                            board: self.board.game.board().clone(),
+                            mv: (src_position, clicked_position),
+                            prom_piece: None,
+                            game_state: protocol::GameState::Ongoing,
+                        });
+
+                        match self.stream.as_mut() {
+                            Some(stream) => { let _ = send_message(&stream, &message); }
+                            None => { self.playing_as = if self.playing_as == Color::White {Color::Black} else {Color::White}; }
+                        };
+
                     }
                 }
                 self.board.selected_position = None;
@@ -384,6 +462,36 @@ impl EventHandler for MyGame {
     }
 }
 
+fn parse_cmd(mut ctx: &mut Context, args: Vec<String>) -> MyGame {
+    if let Some(address) = args.get(1) {
+        if let Some(server_str) = args.get(2) && server_str == "server" {
+            let listener = TcpListener::bind(address);
+            let listener = match listener {
+                Ok(listener) => listener,
+                Err(e) => panic!("Couldn't not bind to address '{}': {e:?}", address),
+            };
+            println!("Waiting for opponent...");
+            let stream = match listener.accept() {
+                Ok((stream, _addr)) => { let _ = stream.set_nonblocking(true); MyGame::new(&mut ctx, Some(stream), Color::White) },
+                Err(e) => panic!("Opponent failed to connect: {e:?}"),
+            };
+            print!("Opponent connected!");
+            stream
+        } else if let Some(client_str) = args.get(2) && client_str == "client" { 
+            let stream = match TcpStream::connect(address) {
+                Ok(stream) => stream,
+                Err(e) => panic!("Failed to connect to opponent: {e:?}"),
+            };
+            let _ = stream.set_nonblocking(true);
+            MyGame::new(&mut ctx, Some(stream), Color::Black)
+        } else {
+            panic!("You have to specify 'server' or 'client' after the address");
+        }
+    } else {
+        MyGame::new(&mut ctx, None, Color::White)
+    }
+}
+
 fn main() {
     let (mut ctx, event_loop) = ContextBuilder::new("my_game", "Author")
         .window_mode(ggez::conf::WindowMode::default().dimensions(SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -393,6 +501,8 @@ fn main() {
 
     ctx.gfx.set_window_title("Chess");
 
-    let my_game = MyGame::new(&mut ctx);
+    let args: Vec<String> = env::args().collect();
+    let my_game = parse_cmd(&mut ctx, args);
+
     event::run(ctx, event_loop, my_game).expect("Program failed");
 }
